@@ -1,0 +1,48 @@
+<?xml version="1.0"?>
+<robot name="piper_description">
+    <!-- Define Joint Groups -->
+    <group name="arm">
+        <joint name="r_joint1" />
+        <joint name="r_joint2" />
+        <joint name="r_joint3" />
+        <joint name="r_joint4" />
+        <joint name="r_joint5" />
+        <joint name="r_joint6" />
+        <joint name="r_joint7" />
+        <chain base_link="base" tip_link="right_ee" />
+    </group>
+
+    <!-- Define End Effector -->
+    <end_effector name="end_effector" parent_link="right_ee" group="arm" />
+
+    <!-- Predefined Joint States -->
+    <group_state name="home" group="arm">
+        <joint name="r_joint1" value="0" />
+        <joint name="r_joint2" value="0" />
+        <joint name="r_joint3" value="0" />
+        <joint name="r_joint4" value="0" />
+        <joint name="r_joint5" value="0" />
+        <joint name="r_joint6" value="0" />
+        <joint name="r_joint7" value="0" />
+    </group_state>
+
+    <group_state name="vertical" group="arm">
+        <joint name="r_joint1" value="0" />
+        <joint name="r_joint2" value="0" />
+        <joint name="r_joint3" value="0" />
+        <joint name="r_joint4" value="0" />
+        <joint name="r_joint5" value="0" />
+        <joint name="r_joint6" value="0" />
+        <joint name="r_joint7" value="0" />
+    </group_state>
+
+    <!-- Disable collisions between adjacent links -->
+    <disable_collisions link1="right_base_link"        link2="right_link1" reason="Adjacent" />
+    <disable_collisions link1="right_base_link"        link2="right_link1" reason="Adjacent" />
+    <disable_collisions link1="right_link1" link2="right_link2" reason="Adjacent" />
+    <disable_collisions link1="right_link2" link2="right_link3" reason="Adjacent" />
+    <disable_collisions link1="right_link3" link2="right_link4" reason="Adjacent" />
+    <disable_collisions link1="right_link4" link2="right_link5" reason="Adjacent" />
+    <disable_collisions link1="right_link5" link2="right_link6" reason="Adjacent" />
+    <disable_collisions link1="right_link6" link2="right_link7" reason="Adjacent" />
+</robot>
