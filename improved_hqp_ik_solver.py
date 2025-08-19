@@ -219,12 +219,12 @@ class ImprovedHQPArm:
         # 速度限位
         self.dq_max = self.robot.model.velocityLimit.copy()
         if self.dq_max is None:
-            self.dq_max = np.full(self.nq, 3.0)  # 默认值
+            self.dq_max = np.full(self.nq, 2.0) # 默认值
         
         # 控制器参数（保持原有值)
-        self.Kp_task = 4.0
-        self.alpha_limit = 10.0
-        self.alpha_perturb = 0.3
+        self.Kp_task = 1.6
+        self.alpha_limit = 3.0
+        self.beta_perturb = 0.8
         self.switch_err_threshold = 1e-3
  
         # 自适应参数
@@ -382,7 +382,7 @@ class ImprovedHQPArm:
         # 自适应正则化（依据最小奇异值）
         s_vals = np.linalg.svd(J, compute_uv=False)
         sigma_min = float(np.min(s_vals)) if s_vals.size > 0 else 0.0
-        lambda_reg = 1e-4 if sigma_min > 1e-2 else 1e-2
+        lambda_reg = 1e-3 if sigma_min > 1e-1 else 1e-1
 
         dq_var = cp.Variable(self.nq)
         obj_primary = cp.sum_squares(W_sqrt @ (J @ dq_var - v_task)) + lambda_reg * cp.sum_squares(dq_var)
@@ -392,6 +392,7 @@ class ImprovedHQPArm:
             dq1 = dq_var.value.reshape((self.nq, 1))
         else:
             # 失败回退：阻尼伪逆
+            print("一级QP求解失败 回退阻尼伪逆法求解")
             J_pinv = self._compute_damped_pseudoinverse(J, min_sigma=1e-3)
             dq_fallback = J_pinv @ v_task
             dq_fallback = np.clip(dq_fallback, dq_min, dq_max)
@@ -431,7 +432,7 @@ class ImprovedHQPArm:
                 z_ref = self.null_perturb.step()
                 obj_perturb = cp.sum_squares(z - z_ref)
 
-                prob2 = cp.Problem(cp.Minimize(self.alpha_limit * obj_limits + 0.3 * obj_perturb),
+                prob2 = cp.Problem(cp.Minimize(self.alpha_limit * obj_limits + self.beta_perturb * obj_perturb),
                                    constraints2)
                 prob2.solve(solver=cp.OSQP, warm_start=True, verbose=False)
                 if prob2.status in ["optimal", "optimal_inaccurate"]:
@@ -502,7 +503,7 @@ class ImprovedHQPArm:
 
 class FourierNullspacePerturbation:
     """基于傅里叶级数的零空间扰动，更自然的周期性运动"""
-    def __init__(self, null_dim: int, dt: float = 0.02, base_period: float = 12.0, num_harmonics: int = 3, amp_scale: float = 5.0):
+    def __init__(self, null_dim: int, dt: float = 0.02, base_period: float = 6.0, num_harmonics: int = 1, amp_scale: float = 5.0):
         self.null_dim = null_dim
         self.dt = dt
         self.t = 0.0
