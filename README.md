@@ -31,7 +31,15 @@
 
 ## 3. 关键数据与约定
 
-- 关节向量：$q \in \mathbb{R}^{n}$，关节速度：$dq \in \mathbb{R}^{n}$。
+- 关节向量：
+- $
+- q \in \mathbb{R}^{n}
+- $
+- ，关节速度：
+- $
+- dq \in \mathbb{R}^{n}
+- $
+- 。
 - 末端相对误差采用 **李群/李代数**：$e \in \mathbb{R}^{6}$，由 $SE(3)$ 的对数映射得到（前3平移、后3旋转）。
 - 任务雅可比：$J \in \mathbb{R}^{6 \times n}$，Pinocchio 计算帧雅可比。
 - 限位：
