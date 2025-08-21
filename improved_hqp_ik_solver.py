@@ -15,7 +15,7 @@ import meshcat_shapes
 import os.path as osp
 import time
 import cvxpy as cp
-from scipy.interpolate import CubicSpline
+from scipy.interpolate import CubicSpline, CubicHermiteSpline
 from scipy.linalg import svd, qr
 
 
@@ -219,13 +219,13 @@ class ImprovedHQPArm:
         # 速度限位
         self.dq_max = self.robot.model.velocityLimit.copy()
         if self.dq_max is None:
-            self.dq_max = np.full(self.nq, 2.0) # 默认值
+            self.dq_max = np.full(self.nq, 3.0)  # 默认值
         
         # 控制器参数（保持原有值)
-        self.Kp_task = 1.6
-        self.alpha_limit = 3.0
+        self.Kp_task = 64.0
+        self.alpha_limit = 10.0
         self.beta_perturb = 0.8
-        self.switch_err_threshold = 1e-3
+        self.switch_err_threshold = 1e-4
  
         # 自适应参数
         self.performance_window = 50
@@ -249,6 +249,30 @@ class ImprovedHQPArm:
             self.viewer.initViewer(open=True)
             self.viewer.loadViewerModel()
             self.viewer.display(self.q)
+        
+        # 日志记录（用于性能分析与轨迹插值）
+        self.control_time = 0.0
+        self.log_t = []
+        self.log_q = []
+        self.log_dq = []
+        self.log_error = []
+        self.log_solve_time = []
+        self.log_status = []
+        self.log_nullspace_usage = []
+        self.log_joint_velocity_norm = []
+        self.log_joint_limit_violation = []
+
+        # 在线1kHz插值缓存（用于实时/部署）
+        self.dt_hi = 0.001
+        self._prev_t = None
+        self._prev_q = None
+        self._prev_dq = None
+        self.log_t_1khz = []
+        self.log_q_1khz = []
+        self.log_dq_1khz = []
+        self._last_seg_t = None
+        self._last_seg_q = None
+        self._last_seg_dq = None
     
     def _compute_jacobian_robust(self, q: np.ndarray) -> Tuple[np.ndarray, np.ndarray, int]:
         """鲁棒的雅可比矩阵计算"""
@@ -282,6 +306,16 @@ class ImprovedHQPArm:
         err = pin.log(goal_pose.actInv(oMf)).vector
         err_norm = np.linalg.norm(err)
         return err, err_norm
+
+    def _map_cvx_status(self, status: str) -> str:
+        """将cvxpy状态映射为标准求解状态字符串"""
+        if status in ["optimal", "optimal_inaccurate"]:
+            return "success"
+        if status == "infeasible":
+            return "infeasible"
+        if status == "unbounded":
+            return "unbounded"
+        return "solver_error"
     
     def _update_performance_metrics(self, task_error: float, solve_time: float):
         """更新性能指标"""
@@ -382,21 +416,23 @@ class ImprovedHQPArm:
         # 自适应正则化（依据最小奇异值）
         s_vals = np.linalg.svd(J, compute_uv=False)
         sigma_min = float(np.min(s_vals)) if s_vals.size > 0 else 0.0
-        lambda_reg = 1e-3 if sigma_min > 1e-1 else 1e-1
+        lambda_reg = 1e-4 if sigma_min > 1e-2 else 1e-2
 
         dq_var = cp.Variable(self.nq)
         obj_primary = cp.sum_squares(W_sqrt @ (J @ dq_var - v_task)) + lambda_reg * cp.sum_squares(dq_var)
         prob1 = cp.Problem(cp.Minimize(obj_primary), [dq_var >= dq_min, dq_var <= dq_max])
         prob1.solve(solver=cp.OSQP, warm_start=True, verbose=False)
+        status_primary = self._map_cvx_status(prob1.status)
         if prob1.status in ["optimal", "optimal_inaccurate"] and dq_var.value is not None:
             dq1 = dq_var.value.reshape((self.nq, 1))
         else:
             # 失败回退：阻尼伪逆
-            print("一级QP求解失败 回退阻尼伪逆法求解")
             J_pinv = self._compute_damped_pseudoinverse(J, min_sigma=1e-3)
             dq_fallback = J_pinv @ v_task
             dq_fallback = np.clip(dq_fallback, dq_min, dq_max)
             dq1 = dq_fallback.reshape((self.nq, 1))
+            if status_primary == "success":
+                status_primary = "solver_error"
         
         # 检查是否启用二级QP（完全按照原始代码）
         if not self.hqp_enabled and err_norm < self.switch_err_threshold:
@@ -435,6 +471,7 @@ class ImprovedHQPArm:
                 prob2 = cp.Problem(cp.Minimize(self.alpha_limit * obj_limits + self.beta_perturb * obj_perturb),
                                    constraints2)
                 prob2.solve(solver=cp.OSQP, warm_start=True, verbose=False)
+                status_secondary = self._map_cvx_status(prob2.status)
                 if prob2.status in ["optimal", "optimal_inaccurate"]:
                     dq = dq1 + (null_basis @ z.value).reshape((self.nq, 1))
                 else:
@@ -458,6 +495,24 @@ class ImprovedHQPArm:
         # 更新性能指标
         solve_time = time.time() - start_time
         self._update_performance_metrics(err_norm, solve_time)
+        # 记录日志（时间、状态、误差等）
+        joint_violation = self._compute_joint_limits_violation(self.q)
+        combined_status = status_primary
+        if self.hqp_enabled and 'status_secondary' in locals() and combined_status == "success":
+            combined_status = status_secondary
+        self.control_time += self.dt
+        self.log_t.append(self.control_time)
+        self.log_q.append(self.q.copy())
+        self.log_dq.append(self.dq.copy())
+        self.log_error.append(float(err_norm))
+        self.log_solve_time.append(float(solve_time))
+        self.log_status.append(combined_status)
+        self.log_nullspace_usage.append(bool(self.hqp_enabled and (self.nq - rank) > 0))
+        self.log_joint_velocity_norm.append(float(np.linalg.norm(self.dq)))
+        self.log_joint_limit_violation.append(float(joint_violation))
+
+        # 在线生成1kHz插值片段（上一控制点 -> 当前控制点）
+        self._append_online_interpolation_segment(self.control_time, self.q.copy(), self.dq.copy())
         
         # 返回结果
         result_info = {
@@ -470,8 +525,120 @@ class ImprovedHQPArm:
         }
         
         return self.q, result_info
+
+    def _append_online_interpolation_segment(self, t_curr: float, q_curr: np.ndarray, dq_curr: np.ndarray) -> None:
+        """追加一段从上一控制时刻到当前控制时刻的1kHz Hermite插值片段"""
+        if self._prev_t is None:
+            self._prev_t = float(t_curr)
+            self._prev_q = q_curr.copy()
+            self._prev_dq = dq_curr.copy()
+            return
+        t0 = float(self._prev_t)
+        t1 = float(t_curr)
+        if t1 - t0 <= 1e-12:
+            self._prev_t = float(t_curr)
+            self._prev_q = q_curr.copy()
+            self._prev_dq = dq_curr.copy()
+            return
+        # 生成高频时间网格（不重复起点，包含终点）
+        t_grid = np.arange(t0 + self.dt_hi, t1 + 1e-12, self.dt_hi)
+        if t_grid.size == 0:
+            self._prev_t = float(t_curr)
+            self._prev_q = q_curr.copy()
+            self._prev_dq = dq_curr.copy()
+            return
+        num_joints = q_curr.shape[0]
+        q_seg = np.zeros((t_grid.shape[0], num_joints))
+        dq_seg = np.zeros_like(q_seg)
+        for j in range(num_joints):
+            hermite = CubicHermiteSpline([t0, t1], [self._prev_q[j], q_curr[j]], [self._prev_dq[j], dq_curr[j]])
+            q_seg[:, j] = hermite(t_grid)
+            dq_seg[:, j] = hermite.derivative()(t_grid)
+        # 追加到缓存
+        self.log_t_1khz.extend(t_grid.tolist())
+        self.log_q_1khz.extend(q_seg.tolist())
+        self.log_dq_1khz.extend(dq_seg.tolist())
+        # 保存最新片段
+        self._last_seg_t = t_grid
+        self._last_seg_q = q_seg
+        self._last_seg_dq = dq_seg
+        # 更新前一控制点
+        self._prev_t = float(t_curr)
+        self._prev_q = q_curr.copy()
+        self._prev_dq = dq_curr.copy()
+
+    def reset_interpolated_history(self) -> None:
+        """清空在线1kHz插值缓存"""
+        self._prev_t = None
+        self._prev_q = None
+        self._prev_dq = None
+        self.log_t_1khz = []
+        self.log_q_1khz = []
+        self.log_dq_1khz = []
+
+    def get_performance_data(self) -> Dict[str, Any]:
+        """导出完整性能数据（供分析器使用）"""
+        return {
+            'solve_times': list(self.log_solve_time),
+            'task_errors': list(self.log_error),
+            'solver_statuses': list(self.log_status),
+            'nullspace_usage': list(self.log_nullspace_usage),
+            'joint_velocities': list(self.log_joint_velocity_norm),
+            'joint_limit_violations': list(self.log_joint_limit_violation),
+            'timestamps': list(self.log_t),
+            'q_samples': np.vstack(self.log_q).tolist() if self.log_q else [],
+            'dq_samples': np.vstack(self.log_dq).tolist() if self.log_dq else []
+        }
+
+    def interpolate_trajectory_1khz(self) -> Dict[str, Any]:
+        """使用三次Hermite插值将(q, dq)重采样为1kHz轨迹"""
+        if len(self.log_t) < 2:
+            return {'t_1khz': [], 'q_1khz': [], 'dq_1khz': []}
+        t_samples = np.array(self.log_t)
+        q_samples = np.vstack(self.log_q)
+        dq_samples = np.vstack(self.log_dq)
+        t_start = float(t_samples[0])
+        t_end = float(t_samples[-1])
+        t_1khz = np.arange(t_start, t_end + 1e-12, 0.001)
+        num_joints = q_samples.shape[1]
+        q_hi = np.zeros((t_1khz.shape[0], num_joints))
+        dq_hi = np.zeros_like(q_hi)
+        for j in range(num_joints):
+            hermite = CubicHermiteSpline(t_samples, q_samples[:, j], dq_samples[:, j])
+            q_hi[:, j] = hermite(t_1khz)
+            dq_hi[:, j] = hermite.derivative()(t_1khz)
+        return {
+            't_1khz': t_1khz,
+            'q_1khz': q_hi,
+            'dq_1khz': dq_hi
+        }
+
+    def get_online_interpolated_data(self) -> Dict[str, Any]:
+        """获取在线生成的1kHz插值历史，可直接下发到实机"""
+        return {
+            't_1khz': np.array(self.log_t_1khz),
+            'q_1khz': np.array(self.log_q_1khz),
+            'dq_1khz': np.array(self.log_dq_1khz)
+        }
+
+    def save_interpolated_trajectory(self, filename: str = "trajectory_1khz_online.npz") -> None:
+        """保存在线1kHz插值轨迹到文件，便于部署"""
+        data = self.get_online_interpolated_data()
+        if data['t_1khz'].size == 0:
+            # 若在线缓存为空，退化为离线整体插值
+            interp = self.interpolate_trajectory_1khz()
+            if len(interp['t_1khz']) == 0:
+                print("无可保存的1kHz轨迹数据")
+                return
+            np.savez(filename, t=np.array(interp['t_1khz']), q=np.array(interp['q_1khz']), dq=np.array(interp['dq_1khz']))
+            print(f"1kHz轨迹(离线重采样)已保存到: {filename}")
+            return
+        np.savez(filename, t=data['t_1khz'], q=data['q_1khz'], dq=data['dq_1khz'])
+        print(f"1kHz轨迹(在线插值缓存)已保存到: {filename}")
     
-    def run_control_loop(self, goal_pose: pin.SE3, runtime: float = 20.0):
+    def run_control_loop(self, goal_pose: pin.SE3, runtime: float = 20.0,
+                         interleave_highrate: bool = True,
+                         stream_callback: Any = None):
         """运行控制循环"""
         t0 = time.time()
         step = 0
@@ -481,9 +648,24 @@ class ImprovedHQPArm:
         while time.time() - t0 < runtime:
             q, info = self.step(goal_pose)
             
-            # 可视化
-            if hasattr(self, 'viewer'):
-                self.viewer.display(q)
+            # 高频插值发布/显示（与可视化解耦）
+            did_hi_loop = False
+            if interleave_highrate and self._last_seg_q is not None and self._last_seg_q.size > 0:
+                did_hi_loop = True
+                for idx in range(self._last_seg_q.shape[0]):
+                    qi = self._last_seg_q[idx]
+                    dqi = self._last_seg_dq[idx]
+                    if stream_callback is not None:
+                        stream_callback(qi, dqi)
+                    if hasattr(self, 'viewer'):
+                        self.viewer.display(qi)
+                    time.sleep(self.dt_hi)
+            else:
+                # 无插值片段时，至少发布/显示控制步末端状态
+                if stream_callback is not None:
+                    stream_callback(q, self.dq)
+                if hasattr(self, 'viewer'):
+                    self.viewer.display(q)
             
             # 打印状态
             if step % 50 == 0:
@@ -496,9 +678,17 @@ class ImprovedHQPArm:
                       f"time={info['solve_time']*1000:.1f}ms")
             
             step += 1
-            time.sleep(self.dt)
+            # 若已经高频插值并(可能)显示/回调了中间状态，则无需重复休眠
+            if not did_hi_loop:
+                time.sleep(self.dt)
         
         print(f"控制循环结束，总步数: {step}")
+
+    def get_last_interpolated_segment(self) -> Dict[str, Any]:
+        """返回最近一个控制周期生成的1kHz插值片段"""
+        if self._last_seg_t is None:
+            return {'t': np.array([]), 'q': np.array([]), 'dq': np.array([])}
+        return {'t': self._last_seg_t.copy(), 'q': self._last_seg_q.copy(), 'dq': self._last_seg_dq.copy()}
 
 
 class FourierNullspacePerturbation:
@@ -538,7 +728,7 @@ def main():
     )
     
     # 创建控制器
-    arm = ImprovedHQPArm(urdf_path, target_frame_name="r_joint7", dt=0.02)
+    arm = ImprovedHQPArm(urdf_path, target_frame_name="r_joint7", dt=0.02 , visualize=True)
     
     # 设置目标位姿（尝试不同的方向）
     desired_rot = np.array([[0, 0, 1], [0, 1, 0], [-1, 0, 0]])
