@@ -17,6 +17,17 @@ import time
 import cvxpy as cp
 from scipy.interpolate import CubicSpline, CubicHermiteSpline
 from scipy.linalg import svd, qr
+import threading
+try:
+    import rclpy
+    from rclpy.node import Node
+    from sensor_msgs.msg import JointState
+    from std_msgs.msg import Header
+except Exception:
+    rclpy = None
+    Node = object
+    JointState = None
+    Header = None
 
 
 def soft_square_wave(t, period=8.0, sharpness=6.0):
@@ -47,6 +58,28 @@ class SolverResult:
     solve_time: float
     iterations: int
     message: str
+    
+class ROS2JointStatePublisher(Node):
+    """ROS2关节状态发布器：直接发布接收到插值后的(q, dq)到/right/ik_robstride_joint_cmd"""
+    def __init__(self, node_name: str = "hqp_ik_joint_publisher_right"):
+        super().__init__(node_name)
+        self.pub = self.create_publisher(JointState, '/right/ik_robstride_joint_cmd', 10)
+
+    def publish_now(self, joint_names, q, dq=None):
+        if JointState is None:
+            return
+        msg = JointState()
+        msg.header = Header()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.name = list(joint_names)
+        msg.position = np.asarray(q, dtype=float).tolist()
+        if dq is None:
+            msg.velocity = [0.0] * len(msg.name)
+        else:
+            msg.velocity = np.asarray(dq, dtype=float).tolist()
+        msg.effort = [0.0] * len(msg.name)
+        self.pub.publish(msg)
+
 
 
 class AdaptiveNullspacePerturbation:
@@ -193,7 +226,8 @@ class ImprovedHQPArm:
     """改进的HQP机械臂控制器"""
     
     def __init__(self, urdf_path: str, target_frame_name: str, 
-                 dt: float = 0.02, visualize: bool = True):
+                 dt: float = 0.02, visualize: bool = True,
+                 ros2_node: 'ROS2JointStatePublisher' = None):
         # 机器人模型
         self.robot = RobotWrapper.BuildFromURDF(
             urdf_path, package_dirs=[osp.dirname(urdf_path)]
@@ -210,6 +244,10 @@ class ImprovedHQPArm:
         self.q_max = self.robot.model.upperPositionLimit.copy()
         self.q_mid = 0.5 * (self.q_min + self.q_max)
         self.nq = self.q_min.shape[0]
+        # 关节名称（用于ROS2发布）
+        self.joint_names = [self.robot.model.names[i] for i in range(1, self.nq + 1)]
+        # 可选ROS2节点
+        self.ros2_node = ros2_node
         
         # 打印初始配置信息
         print(f"初始关节配置: {self.q}")
@@ -273,6 +311,13 @@ class ImprovedHQPArm:
         self._last_seg_t = None
         self._last_seg_q = None
         self._last_seg_dq = None
+        # 若提供ROS2节点，发布初始状态
+        if self.ros2_node is not None:
+            try:
+                self.ros2_node.publish_now(self.joint_names, self.q, np.zeros_like(self.q))
+                print("初始关节状态已发布到: /right/ik_robstride_joint_cmd")
+            except Exception as e:
+                print(f"ROS2初始发布失败: {e}")
     
     def _compute_jacobian_robust(self, q: np.ndarray) -> Tuple[np.ndarray, np.ndarray, int]:
         """鲁棒的雅可比矩阵计算"""
@@ -657,6 +702,11 @@ class ImprovedHQPArm:
                     dqi = self._last_seg_dq[idx]
                     if stream_callback is not None:
                         stream_callback(qi, dqi)
+                    if self.ros2_node is not None:
+                        try:
+                            self.ros2_node.publish_now(self.joint_names, qi, dqi)
+                        except Exception as e:
+                            print(f"ROS2发布失败: {e}")
                     if hasattr(self, 'viewer'):
                         self.viewer.display(qi)
                     time.sleep(self.dt_hi)
@@ -664,6 +714,11 @@ class ImprovedHQPArm:
                 # 无插值片段时，至少发布/显示控制步末端状态
                 if stream_callback is not None:
                     stream_callback(q, self.dq)
+                if self.ros2_node is not None:
+                    try:
+                        self.ros2_node.publish_now(self.joint_names, q, self.dq)
+                    except Exception as e:
+                        print(f"ROS2发布失败: {e}")
                 if hasattr(self, 'viewer'):
                     self.viewer.display(q)
             
@@ -720,6 +775,21 @@ class FourierNullspacePerturbation:
 
 def main():
     """主函数"""
+    # 初始化ROS2（如果可用）
+    ros2_initialized = False
+    ros2_node = None
+    
+    if rclpy is not None:
+        try:
+            rclpy.init()
+            ros2_node = ROS2JointStatePublisher()
+            ros2_initialized = True
+            print("ROS2初始化成功")
+        except Exception as e:
+            print(f"ROS2初始化失败: {e}")
+    else:
+        print("rclpy不可用，将在非ROS2模式下运行")
+    
     # 机器人模型路径
     urdf_path = osp.join(
         osp.dirname(__file__),
@@ -727,24 +797,30 @@ def main():
         "robstride_right.urdf",
     )
     
-    # 创建控制器
-    arm = ImprovedHQPArm(urdf_path, target_frame_name="r_joint7", dt=0.02 , visualize=True)
+    # 创建控制器（传入ROS2节点）
+    arm = ImprovedHQPArm(urdf_path, target_frame_name="r_joint7", dt=0.02, visualize=True, ros2_node=ros2_node)
     
-    # 设置目标位姿（尝试不同的方向）
+    # 设置目标位姿
     desired_rot = np.array([[0, 0, 1], [0, 1, 0], [-1, 0, 0]])
-    # 尝试不同的目标位置，看看哪个方向是正确的
     goal_pose = pin.SE3(desired_rot, np.array([0.5, 0.0, 0.0]))
     print(f"目标位姿设置: 旋转矩阵=\n{desired_rot}")
     print(f"目标位置: {goal_pose.translation}")
-    print(f"目标旋转: {goal_pose.rotation}")
     
     # 可视化目标
     if hasattr(arm, 'viewer'):
         meshcat_shapes.frame(arm.viewer.viewer["target"], opacity=0.5)
         arm.viewer.viewer["target"].set_transform(goal_pose.np)
     
-    # 运行控制循环
-    arm.run_control_loop(goal_pose, runtime=200.0)
+    try:
+        # 运行控制循环
+        arm.run_control_loop(goal_pose, runtime=200.0)
+        
+    finally:
+        # 清理ROS2资源
+        if ros2_initialized and ros2_node is not None:
+            ros2_node.destroy_node()
+            rclpy.shutdown()
+            print("ROS2资源已清理")
 
 
 if __name__ == "__main__":
