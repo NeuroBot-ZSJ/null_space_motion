@@ -22,72 +22,61 @@ from typing import Optional, Tuple, Dict, Any
 from dataclasses import dataclass
 from enum import Enum
 from scipy.linalg import null_space
-try:
-    import rclpy
-    from rclpy.node import Node
-    from sensor_msgs.msg import JointState
-    from std_msgs.msg import Header
-except Exception:
-    rclpy = None
-    Node = object
-    JointState = None
-    Header = None
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import JointState
+from std_msgs.msg import Header
+import os
+import os.path as osp
+
+# 设置 ROS package path
+os.environ['ROS_PACKAGE_PATH'] = '/home/dex/Documents/ros2_robstride_ws/src:' + os.environ.get('ROS_PACKAGE_PATH', '')
  
  
-class NullspaceSinePerturbation:
-    """
-    单一正弦零空间扰动 + 关节限位衰减
-    - 幅度不超过2
-    - 在 q_mid 最大，接近 q_min / q_max 时平滑衰减为 0
-    - 周期正弦扰动，保证运动自然
-    """
-    def __init__(self, null_dim: int, dt: float = 0.02,
-                 base_period: float = 5.0, amp_scale: float = 2.0,
-                 q_min: np.ndarray = None, q_max: np.ndarray = None):
+class FourierNullspacePerturbation:
+    """基于傅里叶级数的零空间扰动，更自然的周期性运动"""
+    def __init__(self, null_dim: int, dt: float = 0.02, base_period: float = 6.0, num_harmonics: int = 1, amp_scale: float = 5.0):
         self.null_dim = null_dim
         self.dt = dt
         self.t = 0.0
         self.base_period = base_period
+        self.num_harmonics = num_harmonics
         self.amp_scale = amp_scale
-        self.q_min = q_min
-        self.q_max = q_max
-        if q_min is not None and q_max is not None:
-            self.q_mid = 0.5 * (q_min + q_max)
+        # 为每个维度、每个谐波生成随机相位
+        self.phases = np.random.uniform(0, 2*np.pi, size=(null_dim, num_harmonics))
+        # 每个谐波的幅度衰减（高频更小）
+        self.harmonic_scales = 1.0 / (np.arange(1, num_harmonics+1))
 
-    def _limit_envelope(self, q: np.ndarray) -> np.ndarray:
-        """
-        平滑关节限位 envelope:
-        - 在 q_mid = 1
-        - 在接近 q_min/q_max 时 → 0
-        - 使用三次平滑函数，保证一阶连续
-        """
-        # 将 q 映射到 [-1,1]，q_mid -> 0
-        normalized_centered = np.tanh(2*(q.flatten()-self.q_mid)/(self.q_max-self.q_min) + 1e-8)
-        # 三次平滑 envelope: q_mid=0 -> 1, q_min/q_max -> 0
-        envelope = 1 - 3 * normalized_centered**2 + 2 * normalized_centered**3
-
-        return envelope
-
-    def step(self, q: np.ndarray) -> np.ndarray:
-        """生成零空间扰动向量"""
+    def step(self) -> np.ndarray:
         self.t += self.dt
         omega = 2 * np.pi / self.base_period
-
-        # 基本正弦波
-        sine_val = np.sin(omega * self.t)
-
-        # 关节限位 envelope
-        envelope = self._limit_envelope(q)
-
-        # 每个自由度扰动
-        z_ref = self.amp_scale * sine_val * envelope[:self.null_dim]
-        return z_ref
+        values = np.zeros(self.null_dim)
+        for i in range(self.null_dim):
+            s = 0.0
+            for k in range(self.num_harmonics):
+                freq = (k + 1)
+                s += self.harmonic_scales[k] * np.sin(freq * omega * self.t + self.phases[i, k])
+            values[i] = s
+        return values * self.amp_scale * 0.5
 
 class ROS2JointStatePublisher(Node):
-    """ROS2关节状态发布器：直接发布接收到的(q, dq)到/right/ik_robstride_joint_cmd"""
-    def __init__(self, node_name: str = "hqp_ik_joint_publisher_right"):
+    """ROS2关节状态订阅、发布器：1.订阅/left/robstride_joint_states当前状态，发布接收到的(q, dq)到/left/robstride_joint_cmd"""
+    def __init__(self, node_name: str = "hqp_ik_joint_publisher_left"):
         super().__init__(node_name)
-        self.pub = self.create_publisher(JointState, '/right/ik_robstride_joint_cmd', 10)
+        self.pub = self.create_publisher(JointState, '/left/robstride_joint_cmd', 10)
+        self.actual_q = None
+        self.actual_dq = None
+        self.subscription = self.create_subscription(
+            JointState,
+            f"/left/robstride_joint_states",
+            self.joint_state_callback,
+            10,
+        )
+
+    def joint_state_callback(self, msg):
+        self.joint_names = msg.name
+        self.actual_q = np.array(msg.position)
+        self.actual_dq = np.array(msg.velocity)
 
     def publish_now(self, joint_names, q, dq=None):
         if JointState is None:
@@ -103,7 +92,6 @@ class ROS2JointStatePublisher(Node):
             msg.velocity = np.asarray(dq, dtype=float).tolist()
         msg.effort = [0.0] * len(msg.name)
         self.pub.publish(msg)
-    
 
 class HQPController:
     """HQP机械臂控制器"""
@@ -121,9 +109,11 @@ class HQPController:
         # 可选ROS2节点
         self.ros2_node = ros2_node
         
-        # 关节状态（保持原有初始化）
-        self.q = pin.neutral(self.robot.model)
-        self.dq = np.zeros_like(self.q)
+        # 关节初始状态以及期望状态
+        self.init_q = self.ros2_node.actual_q
+        self.init_dq = self.ros2_node.actual_dq
+        self.desired_q = self.ros2_node.actual_q
+        self.desired_dq = self.ros2_node.actual_dq
 
         # 关节限位
         self.q_min = self.robot.model.lowerPositionLimit.copy()
@@ -134,24 +124,24 @@ class HQPController:
         self.joint_names = [self.robot.model.names[i] for i in range(1, self.nq + 1)]
         
         # 打印初始配置信息
-        print(f"初始关节配置: {self.q}")
+        print(f"初始关节配置: {self.init_q}")
         print(f"关节限位: min={self.q_min}, max={self.q_max}")
         print(f"目标帧ID: {self.FRAME_ID}")
         
         # 速度限位
         self.dq_max = self.robot.model.velocityLimit.copy()
         if self.dq_max is None:
-            self.dq_max = np.full(self.nq, 0.5)  # 默认值
+            self.dq_max = np.full(self.nq, 0.3)  # 默认值
         
         # 控制器参数（保持原有值)
-        self.Kp_task = 1.0
+        self.Kp_task = 7.6
         self.alpha_limit = 10.0
         self.beta_perturb = 0.3
-        self.switch_err_threshold = 1e-3
+        self.switch_err_threshold = 5*1e-2
         # 新增：任务空间速度上限与关节加速度上限（提升平滑性）
-        self.v_task_max = 0.5  # 任务空间速度范数上限（m/s 与 rad/s 混合量纲）
+        self.v_task_max = 0.3  # 任务空间速度范数上限（m/s 与 rad/s 混合量纲）
 
-        self.prev_dq = np.zeros_like(self.q)      # 上一步的关节速度（用于平滑）
+        self.prev_dq = np.zeros_like(self.init_dq)      # 上一步的关节速度（用于平滑）
         # 平滑权重（可调）
         self.w_vel_smooth = 1e-2    # 惩罚 dq 与上一步 dq 突变，越大越平滑但响应慢
         self.w_jerk = 1e-3          # 惩罚加速度（近似 jerk），按需打开
@@ -160,7 +150,7 @@ class HQPController:
         self.performance_window = 50
         self.task_error_history = []
         self.solve_time_history = []
- 
+
         # 零空间扰动
         self.null_perturb = None
         self.hqp_enabled = False
@@ -172,7 +162,7 @@ class HQPController:
             )
             self.viewer.initViewer(open=True)
             self.viewer.loadViewerModel()
-            self.viewer.display(self.q)
+            self.viewer.display(self.init_q)
         
         # 日志记录（用于性能分析）
         self.control_time = 0.0
@@ -189,8 +179,8 @@ class HQPController:
         # 若提供ROS2节点，发布初始状态
         if self.ros2_node is not None:
             try:
-                self.ros2_node.publish_now(self.joint_names, self.q, self.dq)
-                print("初始关节状态已发布到: /right/ik_robstride_joint_cmd")
+                self.ros2_node.publish_now(self.joint_names, self.init_q, self.init_dq)
+                print("初始关节状态已发布到: /left/robstride_joint_cmd")
             except Exception as e:
                 print(f"ROS2初始发布失败: {e}")
     
@@ -282,8 +272,9 @@ class HQPController:
         """执行一个控制步（重构版，支持整体速度平滑）"""
         start_time = time.time()
 
+        actual_q=self.ros2_node.actual_q
         # 前向运动学
-        pin.forwardKinematics(self.robot.model, self.robot.data, self.q)
+        pin.forwardKinematics(self.robot.model, self.robot.data, actual_q)
         pin.updateFramePlacements(self.robot.model, self.robot.data)
 
         # 任务误差
@@ -303,11 +294,11 @@ class HQPController:
         print(f"任务速度: {v_task}")
 
         # 雅可比矩阵
-        J, null_basis, rank = self._compute_jacobian_robust(self.q)
+        J, null_basis, rank = self._compute_jacobian_robust(actual_q)
 
         # 关节速度约束
-        dq_min = np.maximum((self.q_min - self.q.flatten()) / self.dt, -self.dq_max)
-        dq_max = np.minimum((self.q_max - self.q.flatten()) / self.dt, self.dq_max)
+        dq_min = np.maximum((self.q_min - actual_q.flatten()) / self.dt, -self.dq_max)
+        dq_max = np.minimum((self.q_max - actual_q.flatten()) / self.dt, self.dq_max)
 
         # 一级QP
         dq_var = cp.Variable(self.nq)
@@ -332,8 +323,7 @@ class HQPController:
             self.hqp_enabled = True
             null_dim = self.nq - rank
             if null_dim > 0:
-                self.null_perturb = NullspaceSinePerturbation(null_dim=null_dim, dt=self.dt, amp_scale=1.5,
-                                                            q_min=self.q_min, q_max=self.q_max)
+                self.null_perturb = FourierNullspacePerturbation(null_dim=null_dim, dt=self.dt, amp_scale=0.75)
                 print(">>> HQP 二级扰动已启用")
 
         # 二级QP
@@ -343,9 +333,9 @@ class HQPController:
             z_var = cp.Variable(null_dim)
             dq_expr = dq1.flatten() + null_basis @ z_var
 
-            normalized = 2.0 * ((self.q.flatten() + dq_expr * self.dt) - self.q_mid) / ((self.q_max - self.q_min) + 1e-8)
+            normalized = 2.0 * ((actual_q.flatten() + dq_expr * self.dt) - self.q_mid) / ((self.q_max - self.q_min) + 1e-8)
             obj_limits = cp.sum_squares(normalized)
-            z_ref = self.null_perturb.step(self.q) if self.null_perturb else np.zeros(null_dim)
+            z_ref = self.null_perturb.step() if self.null_perturb else np.zeros(null_dim)
             obj_perturb = cp.sum_squares(z_var - z_ref)
 
             # 整体速度平滑 & jerk
@@ -362,7 +352,7 @@ class HQPController:
                 dq_total = (dq1 + (null_basis @ z_var.value).reshape((self.nq, 1)))
             else:
                 dq_total = dq1
-            if err_norm > 30 * self.switch_err_threshold:
+            if err_norm > 10 * self.switch_err_threshold:
                 dq_total = np.zeros_like(dq_total)
                 print(">>> 零空间运动严重影响了末端执行器位姿不变")
 
@@ -373,42 +363,41 @@ class HQPController:
             dq_total = dq_total / norm_dq * max_step
 
         # 更新关节
-        self.q = pin.integrate(self.robot.model, self.q, dq_total.flatten() * self.dt)
-        self.q = pin.normalize(self.robot.model, self.q)
-        self.dq = dq_total.flatten()
-        self.prev_dq = self.dq.copy()
+        self.desired_q = pin.integrate(self.robot.model, actual_q, dq_total.flatten() * self.dt)
+        self.desired_q = pin.normalize(self.robot.model, self.desired_q)
+        self.desired_dq = dq_total.flatten()
+        self.prev_dq = self.desired_dq.copy()
 
         # 更新性能指标 & 日志
         solve_time = time.time() - start_time
         self._update_performance_metrics(err_norm, solve_time)
-        joint_violation = self._compute_joint_limits_violation(self.q)
+        joint_violation = self._compute_joint_limits_violation(self.desired_q)
         combined_status = status_primary
         if self.hqp_enabled:
             combined_status = "success" if prob2.status in ["optimal", "optimal_inaccurate"] else status_primary
 
         self.control_time += self.dt
         self.log_t.append(self.control_time)
-        self.log_q.append(self.q.copy())
-        self.log_dq.append(self.dq.copy())
+        self.log_q.append(self.desired_q.copy())
+        self.log_dq.append(self.desired_dq.copy())
         self.log_error.append(float(err_norm))
         self.log_solve_time.append(float(solve_time))
         self.log_status.append(combined_status)
         self.log_nullspace_usage.append(bool(self.hqp_enabled and (self.nq - rank) > 0))
-        self.log_joint_velocity_norm.append(float(np.linalg.norm(self.dq)))
+        self.log_joint_velocity_norm.append(float(np.linalg.norm(self.desired_dq)))
         self.log_joint_limit_violation.append(float(joint_violation))
 
         # 返回
         result_info = {
             'error_norm': err_norm,
             'hqp_enabled': self.hqp_enabled,
-            'dq_norm': float(np.linalg.norm(self.dq)),
+            'dq_norm': float(np.linalg.norm(self.desired_dq)),
             'solve_time': solve_time,
             'rank': rank,
             'null_dim': self.nq - rank
         }
 
-        return self.q, self.dq, result_info
-
+        return self.desired_q, self.desired_dq, result_info
 
     def get_performance_data(self) -> Dict[str, Any]:
         """导出完整性能数据（供分析器使用）"""
@@ -457,37 +446,52 @@ class HQPController:
         
         print(f"控制循环结束，总步数: {step}")
 
+def _spin_node(node):
+        try:
+            rclpy.spin(node)
+        except Exception as e:
+            print(f"ROS2 spin 线程退出: {e}")
+
+def wait_for_first_state(ros_node, timeout=5.0):
+    """等待第一个 JointState 到达，超时后返回 False"""
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if getattr(ros_node, "actual_q", None) is not None:
+            return True
+        time.sleep(0.01)
+    return False
 
 def main():
     """主函数"""
-    # 初始化ROS2（如果可用）
-    ros2_initialized = False
-    ros2_node = None
-    
-    if rclpy is not None:
-        try:
-            rclpy.init()
-            ros2_node = ROS2JointStatePublisher()
-            ros2_initialized = True
-            print("ROS2初始化成功")
-        except Exception as e:
-            print(f"ROS2初始化失败: {e}")
-    else:
-        print("rclpy不可用，将在非ROS2模式下运行")
+    # 初始化ROS2
+    rclpy.init()
+    ros2_node = ROS2JointStatePublisher()
+    ros2_initialized = True
+    # 在 main() 中 ros2_node 创建后加上：
+    spin_thread = threading.Thread(target=_spin_node, args=(ros2_node,), daemon=True)
+    spin_thread.start()
+    print("ROS2初始化成功")
+    # 等待真实初始状态
+    print("等待 JointState ...")
+    if not wait_for_first_state(ros2_node, timeout=5.0):
+        print("❌ 在超时时间内未收到 JointState，程序退出。")
+        rclpy.shutdown()
+        return
+    print("✅ 收到 JointState，初始化 HQP 求解器。")
     
     # 机器人模型路径
     urdf_path = osp.join(
         osp.dirname(__file__),
         "7dof_robstride",
-        "robstride_right.urdf",
+        "robstride_left.urdf",
     )
     
     # 创建控制器（传入ROS2节点）
-    arm = HQPController(urdf_path, target_frame_name="r_joint7", dt=0.01, visualize=True, ros2_node=ros2_node)
+    arm = HQPController(urdf_path, target_frame_name="l_joint7", dt=0.005, visualize=True, ros2_node=ros2_node)
     
     # 设置目标位姿
-    desired_rot = np.array([[0, 0, 1], [0, 1, 0], [-1, 0, 0]])
-    goal_pose = pin.SE3(desired_rot, np.array([0.5, 0.0, 0.0]))
+    desired_rot = np.array([[0, 1, 0], [0, 0, -1], [-1, 0, 0]])
+    goal_pose = pin.SE3(desired_rot, np.array([0.45, 0.1, 0]))
     print(f"目标位姿设置: 旋转矩阵=\n{desired_rot}")
     print(f"目标位置: {goal_pose.translation}")
     
@@ -495,11 +499,9 @@ def main():
     if hasattr(arm, 'viewer'):
         meshcat_shapes.frame(arm.viewer.viewer["target"], opacity=0.5)
         arm.viewer.viewer["target"].set_transform(goal_pose.np)
-    
     try:
         # 运行控制循环
         arm.run_control_loop(goal_pose, runtime=200.0)
-        
     finally:
         # 清理ROS2资源
         if ros2_initialized and ros2_node is not None:
@@ -510,5 +512,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
