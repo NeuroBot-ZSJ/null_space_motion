@@ -2,7 +2,6 @@
 """
 改进的HQP IK求解器
 - 更好的数值稳定性
-- 自适应扰动策略
 - 性能优化
 - 错误处理机制
 - 参数自适应调整
@@ -32,56 +31,7 @@ except Exception:
     Node = object
     JointState = None
     Header = None
- 
- 
-class NullspaceSinePerturbation:
-    """
-    单一正弦零空间扰动 + 关节限位衰减
-    - 幅度不超过2
-    - 在 q_mid 最大，接近 q_min / q_max 时平滑衰减为 0
-    - 周期正弦扰动，保证运动自然
-    """
-    def __init__(self, null_dim: int, dt: float = 0.02,
-                 base_period: float = 5.0, amp_scale: float = 2.0,
-                 q_min: np.ndarray = None, q_max: np.ndarray = None):
-        self.null_dim = null_dim
-        self.dt = dt
-        self.t = 0.0
-        self.base_period = base_period
-        self.amp_scale = amp_scale
-        self.q_min = q_min
-        self.q_max = q_max
-        if q_min is not None and q_max is not None:
-            self.q_mid = 0.5 * (q_min + q_max)
 
-    def _limit_envelope(self, q: np.ndarray) -> np.ndarray:
-        """
-        平滑关节限位 envelope:
-        - 在 q_mid = 1
-        - 在接近 q_min/q_max 时 → 0
-        - 使用三次平滑函数，保证一阶连续
-        """
-        # 将 q 映射到 [-1,1]，q_mid -> 0
-        normalized_centered = np.tanh(2*(q.flatten()-self.q_mid)/(self.q_max-self.q_min) + 1e-8)
-        # 三次平滑 envelope: q_mid=0 -> 1, q_min/q_max -> 0
-        envelope = 1 - 3 * normalized_centered**2 + 2 * normalized_centered**3
-
-        return envelope
-
-    def step(self, q: np.ndarray) -> np.ndarray:
-        """生成零空间扰动向量"""
-        self.t += self.dt
-        omega = 2 * np.pi / self.base_period
-
-        # 基本正弦波
-        sine_val = np.sin(omega * self.t)
-
-        # 关节限位 envelope
-        envelope = self._limit_envelope(q)
-
-        # 每个自由度扰动
-        z_ref = self.amp_scale * sine_val * envelope[:self.null_dim]
-        return z_ref
 
 class ROS2JointStatePublisher(Node):
     """ROS2关节状态发布器：直接发布接收到的(q, dq)到/right/ik_robstride_joint_cmd"""
@@ -106,7 +56,7 @@ class ROS2JointStatePublisher(Node):
     
 
 class HQPController:
-    """HQP机械臂控制器"""
+    """HQP机械臂控制器 (一级QP: 末端位姿跟踪, 二级QP: 臂型角控制)"""
     
     def __init__(self, urdf_path: str, target_frame_name: str, 
                  dt: float = 0.02, visualize: bool = True,
@@ -136,6 +86,7 @@ class HQPController:
         # 打印初始配置信息
         print(f"初始关节配置: {self.q}")
         print(f"关节限位: min={self.q_min}, max={self.q_max}")
+        print(f"关节限位处臂型角大小: min={self.compute_arm_angle(self.q_min,True)/np.pi*180}, max={self.compute_arm_angle(self.q_max,True)/np.pi*180}")
         print(f"目标帧ID: {self.FRAME_ID}")
         
         # 速度限位
@@ -145,9 +96,7 @@ class HQPController:
         
         # 控制器参数（保持原有值)
         self.Kp_task = 1.0
-        self.alpha_limit = 10.0
-        self.beta_perturb = 0.3
-        self.switch_err_threshold = 1e-3
+        self.switch_err_threshold = 2*1e-3
         # 新增：任务空间速度上限与关节加速度上限（提升平滑性）
         self.v_task_max = 0.5  # 任务空间速度范数上限（m/s 与 rad/s 混合量纲）
 
@@ -161,9 +110,15 @@ class HQPController:
         self.task_error_history = []
         self.solve_time_history = []
  
-        # 零空间扰动
-        self.null_perturb = None
+        # 二级QP零空间运动开启标识
         self.hqp_enabled = False
+        # 关节角限位缓冲带
+        self.margin = 1e-3
+
+        # 臂型角控制
+        self.psi_des = -0.65   # 目标臂型角 (rad)
+        self.k_psi = 0.8    # 收敛增益
+        self.switch_flag = False
         
         # 可视化
         if visualize:
@@ -255,9 +210,7 @@ class HQPController:
         return np.sqrt(violation)
 
     def _compute_adaptive_task_weights(self, err: np.ndarray) -> np.ndarray:
-        """
-        自适应任务权重（6 自由度逐项分配 + 能量感知 + 平滑归一化）
-        """
+        """自适应任务权重（6 自由度逐项分配 + 能量感知 + 平滑归一化）"""
         err_abs = np.abs(err)
         err_sum = np.sum(err_abs) + 1e-8
 
@@ -277,6 +230,47 @@ class HQPController:
         weights = 1.0 + 3.0 * (soft_err / (energy_cost ** beta))
 
         return np.diag(weights)
+
+    def compute_arm_angle(self, q: np.ndarray, signed: bool = True) -> float:
+        """计算臂型角 (参考水平面)"""
+        pin.forwardKinematics(self.robot.model, self.robot.data, q)
+        pin.updateFramePlacements(self.robot.model, self.robot.data)
+
+        # 取肩、肘、腕位置
+        # SRS构型理论上应该是2、4、6关节，但是工程上常用1、4、7
+        S = self.robot.data.oMi[1].translation   # joint1
+        E = self.robot.data.oMi[4].translation   # joint4
+        W = self.robot.data.oMi[7].translation   # joint7
+
+        v_se = E - S
+        v_ew = W - E
+        n = np.cross(v_se, v_ew)
+        if np.linalg.norm(n) < 1e-9:
+            return 0.0
+        n = n / np.linalg.norm(n)
+
+        r = np.array([0, 0, 1.0])  # 水平面的法向量
+        psi = float(np.arctan2(np.linalg.norm(np.cross(n, r)), np.dot(n, r)))
+
+        if not signed:
+            return psi
+        u_sw = (W - S) / (np.linalg.norm(W - S) + 1e-12)
+        sign_val = np.sign(np.dot(np.cross(u_sw, r), n))
+        return float(sign_val * psi)
+
+    def numeric_jacobian_psi(self, q: np.ndarray, delta: float = 1e-15) -> np.ndarray:
+        """数值求臂型角对关节角的Jacobian"""
+        psi0 = self.compute_arm_angle(q, signed=True)
+        J = np.zeros((1, q.size))
+        for i in range(q.size):
+            dq = np.zeros_like(q)
+            dq[i] = delta
+            psi_p = self.compute_arm_angle(q + dq, signed=True)
+            dpsi = psi_p - psi0
+            if dpsi > np.pi: dpsi -= 2*np.pi
+            elif dpsi < -np.pi: dpsi += 2*np.pi
+            J[0, i] = dpsi / delta
+        return J
 
     def step(self, goal_pose: pin.SE3) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
         """执行一个控制步（重构版，支持整体速度平滑）"""
@@ -332,9 +326,7 @@ class HQPController:
             self.hqp_enabled = True
             null_dim = self.nq - rank
             if null_dim > 0:
-                self.null_perturb = NullspaceSinePerturbation(null_dim=null_dim, dt=self.dt, amp_scale=1.5,
-                                                            q_min=self.q_min, q_max=self.q_max)
-                print(">>> HQP 二级扰动已启用")
+                print(">>> HQP 二级QP已启用，开始零空间运动")
 
         # 二级QP
         dq_total = dq1.copy()
@@ -343,18 +335,41 @@ class HQPController:
             z_var = cp.Variable(null_dim)
             dq_expr = dq1.flatten() + null_basis @ z_var
 
-            normalized = 2.0 * ((self.q.flatten() + dq_expr * self.dt) - self.q_mid) / ((self.q_max - self.q_min) + 1e-8)
-            obj_limits = cp.sum_squares(normalized)
-            z_ref = self.null_perturb.step(self.q) if self.null_perturb else np.zeros(null_dim)
-            obj_perturb = cp.sum_squares(z_var - z_ref)
+            # ---- 臂型角任务 ----
+            psi = self.compute_arm_angle(self.q.flatten(), signed=True)
+            print(f"当前臂型角: {psi}")
+            e_psi = psi - self.psi_des
 
-            # 整体速度平滑 & jerk
+            # 如果已经达到目标范围，并且还没切换过
+            if abs(e_psi) < 0.01 and not self.switch_flag:
+                self.switch_flag = True   # 标记：已经切换过目标
+                # 机械臂水平时臂型角为0.16,加偏置让机械臂对称往复运动
+                if self.psi_des > 0.96 and self.psi_des < 0.98:
+                    self.psi_des = -0.65
+                else:
+                    self.psi_des = 0.97
+
+            # 如果误差离开目标区间，则允许下次切换
+            if abs(e_psi) > 0.6:
+                self.switch_flag = False
+            
+            psi_dot_des = - self.k_psi * e_psi
+            Jpsi = self.numeric_jacobian_psi(self.q.flatten())
+
+            # ⚠️ 只对 nullspace 分量施加臂角控制
+            obj_arm = cp.sum_squares(Jpsi @ (null_basis @ z_var) - psi_dot_des)
+
+            # ---- 附加项：关节中心化 + 平滑 ----
+            q_next = self.q.flatten() + dq_expr * self.dt
+            obj_center = cp.sum_squares((q_next - self.q_mid) / (self.q_max - self.q_min + 1e-8))
             obj_vel_smooth = self.w_vel_smooth * cp.sum_squares(dq_expr - self.prev_dq)
             obj_jerk = self.w_jerk * cp.sum_squares((dq_expr - self.prev_dq) / max(self.dt, 1e-6))
 
-            obj_secondary = self.alpha_limit * obj_limits + self.beta_perturb * obj_perturb + obj_vel_smooth + obj_jerk
+            # 合成目标函数
+            obj_secondary = 0.5 * obj_arm + 0.1 * obj_center + obj_vel_smooth + obj_jerk
 
             constraints2 = [dq_expr >= dq_min, dq_expr <= dq_max, z_var >= -2.0, z_var <= 2.0]
+            constraints2 += [q_next >= self.q_min + self.margin, q_next <= self.q_max - self.margin]
             prob2 = cp.Problem(cp.Minimize(obj_secondary), constraints2)
             prob2.solve(solver=cp.OSQP, warm_start=True, verbose=False, eps_abs=1e-4, eps_rel=1e-4, max_iter=20000)
 
@@ -362,7 +377,7 @@ class HQPController:
                 dq_total = (dq1 + (null_basis @ z_var.value).reshape((self.nq, 1)))
             else:
                 dq_total = dq1
-            if err_norm > 30 * self.switch_err_threshold:
+            if err_norm > 10 * self.switch_err_threshold:
                 dq_total = np.zeros_like(dq_total)
                 print(">>> 零空间运动严重影响了末端执行器位姿不变")
 
@@ -408,21 +423,6 @@ class HQPController:
         }
 
         return self.q, self.dq, result_info
-
-
-    def get_performance_data(self) -> Dict[str, Any]:
-        """导出完整性能数据（供分析器使用）"""
-        return {
-            'solve_times': list(self.log_solve_time),
-            'task_errors': list(self.log_error),
-            'solver_statuses': list(self.log_status),
-            'nullspace_usage': list(self.log_nullspace_usage),
-            'joint_velocities': list(self.log_joint_velocity_norm),
-            'joint_limit_violations': list(self.log_joint_limit_violation),
-            'timestamps': list(self.log_t),
-            'q_samples': np.vstack(self.log_q).tolist() if self.log_q else [],
-            'dq_samples': np.vstack(self.log_dq).tolist() if self.log_dq else []
-        }
 
     def run_control_loop(self, goal_pose: pin.SE3, runtime: float = 20.0):
         """运行控制循环"""
