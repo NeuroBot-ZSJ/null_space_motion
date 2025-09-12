@@ -95,7 +95,7 @@ class HQPController:
             self.dq_max = np.full(self.nq, 0.5)  # 默认值
         
         # 控制器参数（保持原有值)
-        self.Kp_task = 1.0
+        self.Kp_task = 16.0
         self.switch_err_threshold = 2*1e-3
         # 新增：任务空间速度上限与关节加速度上限（提升平滑性）
         self.v_task_max = 0.5  # 任务空间速度范数上限（m/s 与 rad/s 混合量纲）
@@ -258,18 +258,21 @@ class HQPController:
         sign_val = np.sign(np.dot(np.cross(u_sw, r), n))
         return float(sign_val * psi)
 
-    def numeric_jacobian_psi(self, q: np.ndarray, delta: float = 1e-15) -> np.ndarray:
-        """数值求臂型角对关节角的Jacobian"""
-        psi0 = self.compute_arm_angle(q, signed=True)
+    def numeric_jacobian_psi(self, q: np.ndarray, delta: float = 1e-6) -> np.ndarray:
+        """数值求臂型角对关节角的Jacobian（中心差分）"""
         J = np.zeros((1, q.size))
         for i in range(q.size):
             dq = np.zeros_like(q)
             dq[i] = delta
             psi_p = self.compute_arm_angle(q + dq, signed=True)
-            dpsi = psi_p - psi0
-            if dpsi > np.pi: dpsi -= 2*np.pi
-            elif dpsi < -np.pi: dpsi += 2*np.pi
-            J[0, i] = dpsi / delta
+            psi_m = self.compute_arm_angle(q - dq, signed=True)
+            dpsi = psi_p - psi_m
+            # 保证差值在 [-pi, pi] 之间（避免跳变）
+            if dpsi > np.pi:
+                dpsi -= 2 * np.pi
+            elif dpsi < -np.pi:
+                dpsi += 2 * np.pi
+            J[0, i] = dpsi / (2 * delta)
         return J
 
     def step(self, goal_pose: pin.SE3) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
@@ -306,16 +309,12 @@ class HQPController:
         # 一级QP
         dq_var = cp.Variable(self.nq)
         W_task = self._compute_adaptive_task_weights(err)
-        obj_task = cp.sum_squares(np.sqrt(W_task) @ (J @ dq_var - v_task))
         s_vals = np.linalg.svd(J, compute_uv=False)
         sigma_min = float(np.min(s_vals)) if s_vals.size > 0 else 0.0
         lambda_reg = 1e-3 if sigma_min > 1e-1 else 1e-1
-        obj_reg = lambda_reg * cp.sum_squares(dq_var)
 
-        obj_primary = obj_task + obj_reg
-
+        obj_primary = cp.sum_squares(np.sqrt(W_task) @ (J @ dq_var - v_task)) + lambda_reg * cp.sum_squares(dq_var)
         constraints = [dq_var >= dq_min, dq_var <= dq_max]
-
         prob1 = cp.Problem(cp.Minimize(obj_primary), constraints)
         prob1.solve(solver=cp.OSQP, warm_start=True, verbose=False, eps_abs=1e-4, eps_rel=1e-4, max_iter=20000)
         status_primary = self._map_cvx_status(prob1.status)
@@ -331,9 +330,7 @@ class HQPController:
         # 二级QP
         dq_total = dq1.copy()
         if self.hqp_enabled and null_basis.size > 0:
-            null_dim = self.nq - rank
-            z_var = cp.Variable(null_dim)
-            dq_expr = dq1.flatten() + null_basis @ z_var
+            dq2_var = cp.Variable(self.nq)
 
             # ---- 臂型角任务 ----
             psi = self.compute_arm_angle(self.q.flatten(), signed=True)
@@ -353,28 +350,27 @@ class HQPController:
             if abs(e_psi) > 0.6:
                 self.switch_flag = False
             
-            psi_dot_des = - self.k_psi * e_psi
+            dpsi_des = - self.k_psi * e_psi
             Jpsi = self.numeric_jacobian_psi(self.q.flatten())
+            # P = np.eye(self.nq) - J.T @ np.linalg.pinv(J @ J.T) @ J
+            P = null_basis @ null_basis.T
 
             # ⚠️ 只对 nullspace 分量施加臂角控制
-            obj_arm = cp.sum_squares(Jpsi @ (null_basis @ z_var) - psi_dot_des)
-
-            # ---- 附加项：关节中心化 + 平滑 ----
+            dq_expr = dq1.flatten() + (P @ dq2_var).flatten()
             q_next = self.q.flatten() + dq_expr * self.dt
-            obj_center = cp.sum_squares((q_next - self.q_mid) / (self.q_max - self.q_min + 1e-8))
-            obj_vel_smooth = self.w_vel_smooth * cp.sum_squares(dq_expr - self.prev_dq)
-            obj_jerk = self.w_jerk * cp.sum_squares((dq_expr - self.prev_dq) / max(self.dt, 1e-6))
 
+            s = cp.Variable(J.shape[0])  # 松弛变量
             # 合成目标函数
-            obj_secondary = 0.5 * obj_arm + 0.1 * obj_center + obj_vel_smooth + obj_jerk
-
-            constraints2 = [dq_expr >= dq_min, dq_expr <= dq_max, z_var >= -2.0, z_var <= 2.0]
+            obj_secondary = cp.sum_squares(Jpsi @ dq1 + Jpsi @ (P @ dq2_var) - dpsi_des) + 1e4 * cp.sum_squares(s)
+            constraints2 = [dq_expr >= dq_min, dq_expr <= dq_max]
             constraints2 += [q_next >= self.q_min + self.margin, q_next <= self.q_max - self.margin]
+            constraints2 += [J @ dq_expr - v_task == s]
             prob2 = cp.Problem(cp.Minimize(obj_secondary), constraints2)
             prob2.solve(solver=cp.OSQP, warm_start=True, verbose=False, eps_abs=1e-4, eps_rel=1e-4, max_iter=20000)
+            dq2 = dq2_var.value.reshape((self.nq, 1))
 
             if prob2.status in ["optimal", "optimal_inaccurate"]:
-                dq_total = (dq1 + (null_basis @ z_var.value).reshape((self.nq, 1)))
+                dq_total = (P @ dq2 + dq1)
             else:
                 dq_total = dq1
             if err_norm > 10 * self.switch_err_threshold:
