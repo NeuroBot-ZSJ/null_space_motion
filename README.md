@@ -4,4 +4,5 @@
 
 ### 2.实机效果
 
-<img src="./assets/null_space_motion_physical.gif" alt="null_space_motion_physical" style="zoom:150%;" />
+![null_space_motion_physical](./assets/null_space_motion_physical.gif)
+
